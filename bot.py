@@ -26,54 +26,68 @@ async def calculate_ev(ctx, *, odds_input: str):
     try:
         await ctx.message.add_reaction('🧠')
         boost_percent = 0
-        parts = odds_input.rsplit(None, 1)
-        if len(parts) == 2:
+        devig_method = None
+        
+        # Parse input - format: odds [boost] [devig_method]
+        parts = odds_input.split()
+        odds_str = parts[0]
+        
+        # Check for boost (numeric)
+        if len(parts) > 1:
             try:
                 boost_percent = float(parts[1])
-                odds_str = parts[0]
+                # Check for devig method (non-numeric)
+                if len(parts) > 2:
+                    devig_method = parts[2]
             except ValueError:
-                odds_str = odds_input
-        else:
-            odds_str = odds_input
+                # parts[1] is not a number, might be devig method
+                devig_method = parts[1]
         
-        if '/' in odds_str:
-            if ':' not in odds_str:
-                await ctx.send('Format: flex/sharp:final')
-                return
-            legs_str, final_str = odds_str.rsplit(':', 1)
-            flex_odds, sharp_odds = [], []
-            for pair in legs_str.split(','):
-                f, s = pair.strip().split('/')
-                flex_odds.append(float(f))
-                sharp_odds.append(float(s))
-            final_odds = float(final_str)
-        else:
-            if ':' not in odds_str:
-                await ctx.send('Format: final:fair')
-                return
-            f, s = odds_str.split(':')
-            flex_odds = [float(f)]
-            sharp_odds = [float(s)]
-            final_odds = float(f)
-        
-        if boost_percent > 0:
-            final_odds = final_odds * (1 + boost_percent / 100)
-        
-        result = await devigger_api.calculate_ev(flex_odds, sharp_odds, final_odds, boost_percent)
+        # Pass the odds string directly to API - it handles juice specifications
+        # Format: flex/sharp:final or with juice like +285/15%:+300
+        result = await devigger_api.calculate_ev(odds_str, boost_percent, devig_method)
         if not result.get('success'):
             await ctx.send(f'Error: {result.get("error")}')
             return
         
         data = result['data']
-        embed = discord.Embed(title='EV Results', color=discord.Color.green() if data['ev_percent'] > 0 else discord.Color.red(), description=f'EV: {data["ev_percent"]:.2f}%')
+        embed = discord.Embed(color=discord.Color.green() if data['ev_percent'] > 0 else discord.Color.red())
         
-        for i, (flex, sharp) in enumerate(zip(flex_odds, sharp_odds), 1):
-            embed.add_field(name=f'Leg #{i}', value=f'Flex: {flex:+.0f} | Sharp: {sharp:+.0f}', inline=False)
+        # Expected Value section
+        ev_emoji = '✅' if data['ev_percent'] > 0 else '💩'
+        embed.add_field(name=f'{ev_emoji} Expected Value', value=f"EV: {data['ev_percent']:.2f}%", inline=False)
         
-        embed.add_field(name='Final', value=f'{final_odds:+.0f}', inline=False)
-        embed.add_field(name='Fair', value=f'{data["fair_value"]:+.2f}', inline=False)
-        embed.add_field(name='Kelly 1/4', value=f'{data["kelly_quarter"]:.4f}', inline=False)
-        embed.add_field(name='Method', value='Worst-case', inline=False)
+        # Worst-case method section with leg details
+        legs_text = "Worst-case: (Multiplicative)\n"
+        for i, leg in enumerate(data.get('legs', []), 1):
+            odds_str = leg.get('odds', '')
+            juice = leg.get('market_juice', 0)
+            fv_prob = leg.get('fair_value', 0)  # This is already a probability (decimal)
+            # Convert probability to odds
+            if fv_prob > 0 and fv_prob < 1:
+                fv_odds = (100 * (1 - fv_prob)) / fv_prob if fv_prob >= 0.5 else -(100 * fv_prob) / (1 - fv_prob)
+            else:
+                fv_odds = 0
+            legs_text += f"Leg#{i} ({odds_str}); Market Juice = {juice:.1f}%; Fair Value = {fv_odds:+.0f} ({fv_prob*100:.1f}%)\n"
+        embed.add_field(name='📊 Worst-case Analysis', value=legs_text.strip(), inline=False)
+        
+        # Odds section - show final odds from the input
+        odds_text = f"Final: {odds_str}"
+        if boost_percent > 0:
+            odds_text = f"Final Boost: {odds_str} (+{boost_percent}%)"
+        embed.add_field(name='📍 Odds', value=odds_text, inline=False)
+        
+        # Fair Value & Kelly
+        kelly_data = data.get('kelly_data', {})
+        kelly_full = kelly_data.get('full', 0)
+        kelly_half = kelly_data.get('half', 0)
+        kelly_quarter = kelly_data.get('quarter', 0)
+        fb_percent = data.get('fb_percent', 0)
+        devig_method_display = data.get('devig_method', 'Worst-case')
+        
+        fv_kelly_text = f"FV: {data['fair_value']:+.0f}, Method: {devig_method_display}\n"
+        fv_kelly_text += f"(Full={kelly_full:.2f}u, 1/2={kelly_half:.2f}u, 1/4={kelly_quarter:.2f}u, FB={fb_percent:.2f}%)"
+        embed.add_field(name='⚖️ Fair Value & Kelly', value=fv_kelly_text, inline=False)
         
         await ctx.send(embed=embed)
         await ctx.message.remove_reaction('🧠', bot.user)
@@ -84,10 +98,12 @@ async def calculate_ev(ctx, *, odds_input: str):
 
 @bot.command(name='help_ev')
 async def help_ev(ctx):
-    embed = discord.Embed(title='Help', color=discord.Color.blue())
-    embed.add_field(name='Simple', value='`!ev 450:350`', inline=False)
+    embed = discord.Embed(title='Help - EV Calculator', color=discord.Color.blue())
+    embed.add_field(name='Simple', value='`!ev 450:350`\n`!ev -110/-110:300`', inline=False)
     embed.add_field(name='With Boost', value='`!ev 450:350 49`', inline=False)
-    embed.add_field(name='Complex', value='`!ev -125/100,-200/150:600`', inline=False)
+    embed.add_field(name='With Devig Method', value='`!ev 450:350 m`\n`!ev 450:350 49 m`', inline=False)
+    embed.add_field(name='Juice Examples', value='`!ev +285/15%:+300`\n`!ev +285/[-116/-106]:+300`\n`!ev -270/[-135=-110/-110]:+300`\n`!ev +600/%:+300`', inline=False)
+    embed.add_field(name='Devig Methods', value='`m` (Mult), `a` (Add), `p` (Power), `s` (Shin), `wc` (worst-case, default)', inline=False)
     await ctx.send(embed=embed)
 
 @bot.command(name='status')
